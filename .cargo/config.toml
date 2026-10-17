@@ -1,0 +1,5 @@
+# iroh also builds a cdylib. GNU ld otherwise auto-exports Rust internals and
+# exceeds Windows' 65,535-export limit in debug builds. Explicit DEF exports
+# (including proc-macro entry points) remain available.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

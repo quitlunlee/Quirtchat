@@ -1,0 +1,57 @@
+{
+  "rust_release": "1.99.1",
+  "rust_commit": "58cf8f9c35b355199727627d07ae34a4e2846d67",
+  "source_evidence": [
+    "https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/musl-toolchain.sh",
+    "https://github.com/rust-lang/rust/blob/58cf8f9c35b355199727627d07ae34a4e2846d67/src/ci/docker/scripts/musl.sh",
+    "https://github.com/rust-lang/rust/tree/58cf8f9c35b355199727627d07ae34a4e2846d67/src/llvm-project"
+  ],
+  "files": [
+    {
+      "component": "compiler-builtins",
+      "targets": [
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ],
+      "path": "licenses/rust-runtime/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler-builtins/LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/library/compiler-builtins/LICENSE.txt",
+      "sha256": "ab6eec6caf0fa5775e411c7a8bc6a45c4ef2956b0980b157ab74fc5cd62a928b"
+    },
+    {
+      "component": "libm",
+      "targets": [
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ],
+      "path": "licenses/rust-runtime/58cf8f9c35b355199727627d07ae34a4e2846d67/compiler-builtins/libm/LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/58cf8f9c35b355199727627d07ae34a4e2846d67/library/compiler-builtins/libm/LICENSE.txt",
+      "sha256": "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+    },
+    {
+      "component": "musl 1.2.5 (with Rust toolchain patches)",
+      "targets": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
+      ],
+      "path": "licenses/musl/0784374d561435f7c787a555aeab8ede699ed298/COPYRIGHT",
+      "url": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?id=0784374d561435f7c787a555aeab8ede699ed298",
+      "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+    },
+    {
+      "component": "LLVM libunwind",
+      "targets": [
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
+      ],
+      "path": "licenses/llvm-runtime/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/libunwind/LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/rust-lang/llvm-project/1b9c0d5ff9bbe7634aead059efe6b11a7eeba145/libunwind/LICENSE.TXT",
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+    }
+  ]
+}

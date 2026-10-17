@@ -1,0 +1,2 @@
+# Preserve pinned upstream bytes so license SHA-256 checks match on every OS.
+packaging/licenses/** -text -whitespace

@@ -1,0 +1,103 @@
+name: Build release archives
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and package all native targets
+    uses: ./.github/workflows/ci.yml
+    with:
+      package: true
+      # Manual runs build downloadable artifacts, even when a tag is selected.
+      release-tag: ${{ github.event_name == 'push' && github.ref_name || '' }}
+
+  bundle:
+    name: Verify all five packages
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Download checked native packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # Never merge a previous attempt's already assembled release-bundle.
+          pattern: release-package-*
+          path: dist/releases
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify package completeness and checksums
+        run: python scripts/release.py checksums --dir dist/releases --require-all
+
+      - name: Upload complete distribution
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle
+          path: dist/releases/*
+          overwrite: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  draft:
+    name: Create draft for human review
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: dist/releases
+          digest-mismatch: error
+
+      - name: Create or refresh the unpublished draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Native CLIChat packages for Windows x64, macOS Apple Silicon / Intel, and Linux x64 / ARM64.
+
+          Each package passed native tests, binary dependency checks, and encrypted-profile smoke tests. Verify downloads against SHA256SUMS before use. Archives include installation instructions and dependency license notices.
+
+          macOS binaries are ad-hoc signed for integrity. They are not signed with an Apple Developer ID and are not notarized; Gatekeeper may require explicit approval. The deployment target is macOS 11.0; automated execution was tested on macOS 15 runners.
+
+          This draft is awaiting review. No automatic public release is performed.
+          NOTES
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2> "$RUNNER_TEMP/release-view-error"; then
+            if [ "$(cat "$RUNNER_TEMP/is-draft")" != true ]; then
+              echo 'Refusing to overwrite an already published release.' >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" dist/releases/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/releases/* --verify-tag --draft \
+              --title "CLIChat $RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

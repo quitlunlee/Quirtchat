@@ -1,0 +1,236 @@
+name: Native builds and tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+    inputs:
+      package:
+        description: Build and upload release archives after all checks
+        type: boolean
+        default: false
+      release-tag:
+        description: Optional tag that must match Cargo.toml
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  RUST_BACKTRACE: "1"
+  OPENSSL_STATIC: "1"
+  OPENSSL_NO_VENDOR: "0"
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            exe: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            exe: ""
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            exe: ""
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET_TRIPLE: ${{ matrix.target }}
+      BINARY_PATH: target/${{ matrix.target }}/release/clichat${{ matrix.exe }}
+      RELEASE_TAG: ${{ inputs.release-tag || '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Test release tooling
+        run: python -m unittest discover -s scripts -p test_release.py -v
+
+      - name: Verify package version
+        shell: python {0}
+        run: |
+          import os, subprocess
+          command = ["python", "scripts/release.py", "version"]
+          if os.environ["RELEASE_TAG"]:
+              command += ["--tag", os.environ["RELEASE_TAG"]]
+          subprocess.run(command, check=True)
+
+      - name: Install the repository's Rust toolchain
+        shell: python {0}
+        run: |
+          import os, pathlib, subprocess, tomllib
+          channel = tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          subprocess.run(["rustup", "toolchain", "install", channel, "--profile", "minimal",
+                          "--component", "rustfmt,clippy", "--target", os.environ["TARGET_TRIPLE"]], check=True)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"RUSTUP_TOOLCHAIN={channel}\n")
+
+      - name: Prepare native musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential musl-tools perl pkg-config clang cmake
+          target_key="${TARGET_TRIPLE//-/_}"
+          cargo_key="${target_key^^}"
+          echo "CC_${target_key}=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${cargo_key}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          # Match musl-gcc's ET_EXEC output to the non-PIE musl startup object.
+          # Target-scoped flags leave host build scripts and proc macros alone.
+          echo "CARGO_TARGET_${cargo_key}_RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static -C link-arg=-static" >> "$GITHUB_ENV"
+
+      - name: Prepare native Windows Perl and static CRT
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @('C:\Strawberry\perl\bin\perl.exe', 'C:\Perl64\bin\perl.exe')
+          $candidates += @(Get-Command perl.exe -All -ErrorAction SilentlyContinue | ForEach-Object Source)
+          $nativePerl = $null
+          Remove-Item Env:PERL5LIB, Env:PERL5OPT -ErrorAction SilentlyContinue
+          foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            if (!(Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            $platform = & $candidate -e 'print $^O' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $platform -eq 'MSWin32') {
+              $nativePerl = $candidate
+              break
+            }
+          }
+          if (!$nativePerl) { throw 'Native Windows Perl is required; Git/MSYS Perl is not supported.' }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $nativePerl)
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "OPENSSL_SRC_PERL=$nativePerl"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'PERL5LIB='
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'PERL5OPT='
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static'
+          & $nativePerl --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check formatting
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo fmt --all --check
+
+      - name: Lint native target
+        run: cargo clippy --locked --all-targets --target "$TARGET_TRIPLE" -- -D warnings
+
+      - name: Test native target
+        run: cargo test --locked --all-targets --target "$TARGET_TRIPLE"
+
+      - name: Build release executable
+        run: cargo build --release --locked --bin clichat --target "$TARGET_TRIPLE"
+
+      - name: Verify fully static Linux executable
+        if: runner.os == 'Linux'
+        run: |
+          readelf --file-header "$BINARY_PATH"
+          if readelf --program-headers "$BINARY_PATH" | grep -q 'INTERP'; then
+            echo 'A musl release must not require a dynamic interpreter.' >&2
+            exit 1
+          fi
+          if readelf --dynamic "$BINARY_PATH" | grep -q '(NEEDED)'; then
+            echo 'A musl release must not require shared libraries.' >&2
+            exit 1
+          fi
+
+      - name: Verify Windows runtime dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'Visual C++ tools were not found.' }
+          Import-Module (Join-Path $vs.Trim() 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs.Trim() -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $dependencies = & dumpbin.exe /DEPENDENTS $env:BINARY_PATH
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dependencies | Write-Output
+          if (($dependencies -join "`n") -match '(?im)^\s*(VCRUNTIME[^\s]*|MSVCP[^\s]*|CONCRT[^\s]*|ucrtbase|api-ms-win-crt-[^\s]*|libcrypto[^\s]*|libssl[^\s]*|sqlcipher[^\s]*|sqlite3[^\s]*)\.dll\s*$') {
+            throw 'The release unexpectedly requires an external CRT, OpenSSL, or SQLCipher DLL.'
+          }
+
+      - name: Verify macOS deployment target and sign locally
+        if: runner.os == 'macOS'
+        shell: python {0}
+        run: |
+          import os, re, subprocess
+          binary = os.environ["BINARY_PATH"]
+          load_commands = subprocess.check_output(["otool", "-l", binary], text=True)
+          versions = []
+          for block in re.split(r"^Load command \d+\s*$", load_commands, flags=re.M):
+              field = None
+              if re.search(r"^\s*cmd LC_BUILD_VERSION\s*$", block, re.M):
+                  field = "minos"
+              elif re.search(r"^\s*cmd LC_VERSION_MIN_MACOSX\s*$", block, re.M):
+                  field = "version"
+              if field:
+                  match = re.search(rf"^\s*{field}\s+(\d+(?:\.\d+){{1,2}})\s*$", block, re.M)
+                  if not match:
+                      raise SystemExit("Missing Mach-O deployment version")
+                  versions.append((tuple(map(int, match[1].split('.'))) + (0, 0))[:3])
+          if not versions or any(version > (11, 0, 0) for version in versions):
+              raise SystemExit("Mach-O deployment target exceeds macOS 11.0")
+          dependencies = subprocess.check_output(["otool", "-L", binary], text=True)
+          print(dependencies)
+          for line in dependencies.splitlines()[1:]:
+              if line.strip() and not line.strip().startswith(("/usr/lib/", "/System/Library/")):
+                  raise SystemExit("The macOS release depends on a non-system dynamic library")
+          # Ad-hoc integrity signing only: no Developer ID identity or notarization.
+          subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", binary], check=True)
+          subprocess.run(["codesign", "--verify", "--strict", "--verbose=2", binary], check=True)
+
+      - name: Smoke-test the release executable
+        shell: python {0}
+        run: |
+          import os, subprocess
+          binary = os.environ["BINARY_PATH"]
+          subprocess.run([binary, "--version"], check=True)
+          subprocess.run(["python", "scripts/release.py", "smoke", "--binary", binary], check=True)
+
+      - name: Package release and dependency notices
+        if: inputs.package == true
+        shell: python {0}
+        run: |
+          import os, pathlib, subprocess
+          target = os.environ["TARGET_TRIPLE"]
+          metadata = pathlib.Path(".tmp/release-metadata.json")
+          metadata.parent.mkdir(exist_ok=True)
+          metadata.write_bytes(subprocess.check_output(["cargo", "metadata", "--locked",
+                              "--format-version", "1", "--filter-platform", target]))
+          subprocess.run(["python", "scripts/release.py", "package", "--target", target,
+                          "--binary", os.environ["BINARY_PATH"], "--metadata", str(metadata),
+                          "--out-dir", "dist/releases"], check=True)
+
+      - name: Upload checked release archive
+        if: inputs.package == true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-package-${{ matrix.target }}
+          path: dist/releases/*
+          overwrite: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

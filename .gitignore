@@ -1,0 +1,16 @@
+/target/
+/.tools/
+/.tmp/
+/dist/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.salt
+*.db.lock
+*.invite
+*.lockfile
