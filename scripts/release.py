@@ -12,6 +12,7 @@ import secrets
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -359,6 +360,10 @@ def checksums(directory: Path, require_all: bool) -> Path:
 
 
 def main() -> None:
+    # Windows redirected output may use an ANSI code page that cannot represent
+    # the workspace path. Emit UTF-8 consistently with our subprocess capture.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
     get_version = commands.add_parser("version")

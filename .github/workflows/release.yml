@@ -2,7 +2,11 @@ name: Build release archives
 
 on:
   push:
+    # Register this workflow when it changes on the default branch. Branch
+    # events skip all jobs below; tag pushes are not subject to path filters.
+    branches: ["master"]
     tags: ["v*"]
+    paths: [".github/workflows/release.yml"]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +19,7 @@ concurrency:
 jobs:
   build:
     name: Test and package all native targets
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/ci.yml
     with:
       package: true
