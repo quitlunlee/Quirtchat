@@ -387,12 +387,16 @@ impl Store {
 
 #[path = "media_store.rs"]
 mod media_store;
+#[path = "server_store.rs"]
+mod server_store;
 
 fn expiring_item_count(state: &AppState) -> usize {
     state.messages.len()
+        + state.hosted.expiring_item_count()
         + state.outbox.len()
         + state.deferred.len()
         + state.message_signatures.len()
+        + state.history_audiences.len()
         + state.media_uploads.len()
         + state.media_downloads.len()
 }
@@ -709,6 +713,45 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .deferred
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn orphan_history_audience_cleanup_is_persisted_on_load_and_purge() {
+        let (directory, store) = profile();
+        let path = directory.path().join("profile.db");
+        let mut state = AppState::default();
+        state
+            .history_audiences
+            .insert("group/deleted-message".into(), vec!["former-member".into()]);
+        store.save_state(&state).unwrap();
+        assert!(
+            store
+                .load_state()
+                .unwrap()
+                .unwrap()
+                .history_audiences
+                .is_empty()
+        );
+        // Read the stored snapshot without invoking another cleanup pass.
+        assert!(
+            read_state(&store.connection)
+                .unwrap()
+                .unwrap()
+                .history_audiences
+                .is_empty()
+        );
+
+        store.save_state(&state).unwrap();
+        assert_eq!(store.purge(crate::model::now()).unwrap(), 1);
+        drop(store);
+        let store = Store::open(&path, "correct horse battery").unwrap();
+        assert!(
+            read_state(&store.connection)
+                .unwrap()
+                .unwrap()
+                .history_audiences
                 .is_empty()
         );
     }

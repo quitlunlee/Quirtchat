@@ -164,7 +164,7 @@ async fn media_scheduler_uploads_then_resumes_cached_download_with_sender_offlin
             Ok(())
         })?;
         let group = alice.app.lock().unwrap().atomic(|app| {
-            let group = app.create_group("real media pair".into(), vec![bob_id])?;
+            let group = app.create_direct("real media pair".into(), bob_id)?;
             app.state.last_rekey.insert(group.clone(), now());
             Ok(group)
         })?;
@@ -327,4 +327,117 @@ async fn media_scheduler_uploads_then_resumes_cached_download_with_sender_offlin
     })
     .await
     .context("three-node media scheduler flow exceeded its deadline")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn media_jobs_follow_signed_cache_address_changes_and_ignore_pex_replacements() -> Result<()>
+{
+    timeout(Duration::from_secs(45), async {
+        let directory = tempfile::tempdir()?;
+        let alice = Node::create(directory.path(), "Alice route").await?;
+        let bob = Node::create(directory.path(), "Bob route").await?;
+        let cache = Node::create(directory.path(), "Cache route").await?;
+        let bob_invitation = bob.app.lock().unwrap().invitation()?;
+        let bob_id = bob_invitation.contact.id.clone();
+        alice
+            .app
+            .lock()
+            .unwrap()
+            .atomic(|app| app.import_contact(bob_invitation))?;
+        connect_contact(&alice.app, &alice.transport, &bob_id).await?;
+        let old_cache_ticket = cache.app.lock().unwrap().ticket.clone();
+        let old_cache_invitation = cache.app.lock().unwrap().invitation()?;
+        // Allocate directly so no live Iroh connection can hide stale-ticket use.
+        let (mailbox_id, write_token, read_token) = cache
+            .app
+            .lock()
+            .unwrap()
+            .store
+            .allocate(&alice.transport.endpoint_id())?;
+        let group = alice.app.lock().unwrap().atomic(|app| {
+            app.import_contact(old_cache_invitation)?;
+            app.state.mailboxes.push(LocalMailbox {
+                public: Mailbox {
+                    node_ticket: old_cache_ticket.clone(),
+                    mailbox_id,
+                    write_token,
+                },
+                read_token,
+                retired_at: None,
+            });
+            let group = app.create_direct("moving cache".into(), bob_id)?;
+            app.state.last_rekey.insert(group.clone(), now());
+            Ok(group)
+        })?;
+        network_tick(&alice.app, &alice.transport, false).await?;
+        let image = directory.path().join("moving.png");
+        let bytes = image_bytes();
+        std::fs::write(&image, &bytes)?;
+        let message_id = send_media(&alice.app, &group, image, String::new()).await?;
+        network_tick(&alice.app, &alice.transport, false).await?;
+        let message = bob
+            .app
+            .lock()
+            .unwrap()
+            .media_message(&message_id, Some(&group))?;
+        let descriptor = message.attachment.as_ref().unwrap();
+        assert!(descriptor.sources.contains(&old_cache_ticket));
+
+        let cache = Node::reopen(cache.stop().await?).await?;
+        let current_invitation = cache.app.lock().unwrap().invitation()?;
+        assert_ne!(current_invitation.contact.ticket, old_cache_ticket);
+        let cache_id = decode_ticket(&current_invitation.contact.ticket)?.id;
+        let forged_pex =
+            encode_ticket(&EndpointAddr::new(cache_id).with_ip_addr("127.0.0.1:9".parse()?))?;
+        for client in [&alice.app, &bob.app] {
+            client.lock().unwrap().atomic(|app| {
+                app.import_contact(current_invitation.clone())?;
+                app.state.peers.push(forged_pex.clone());
+                Ok(())
+            })?;
+        }
+        assert_eq!(
+            alice.app.lock().unwrap().state.media_uploads[0]
+                .mailbox
+                .node_ticket,
+            old_cache_ticket,
+            "the persisted upload deliberately retains its original route"
+        );
+        for _ in 0..descriptor.chunks {
+            media_tick(&alice.app, &alice.transport).await?;
+        }
+        assert!(alice.app.lock().unwrap().state.media_uploads.is_empty());
+        assert_eq!(
+            cache.requests.puts.load(Ordering::Relaxed),
+            descriptor.chunks as usize
+        );
+        alice.stop().await?;
+        bob.app.lock().unwrap().atomic(|app| {
+            app.request_media(&message_id, Some(&group))?;
+            // Sender is offline; exercise the cache source immediately. Source
+            // rotation itself is covered by the existing media scheduler test.
+            app.state.media_downloads[0].source_cursor = 1;
+            Ok(())
+        })?;
+        for _ in 0..descriptor.chunks {
+            media_tick(&bob.app, &bob.transport).await?;
+        }
+        {
+            let app = bob.app.lock().unwrap();
+            assert!(app.state.media_downloads.is_empty());
+            assert_eq!(
+                &*app.media_bytes(&message)?.context("missing file")?,
+                &bytes
+            );
+        }
+        assert_eq!(
+            cache.requests.gets.load(Ordering::Relaxed),
+            descriptor.chunks as usize
+        );
+        bob.stop().await?;
+        cache.stop().await?;
+        Ok(())
+    })
+    .await
+    .context("media route update regression exceeded its deadline")?
 }

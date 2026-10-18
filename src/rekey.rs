@@ -147,7 +147,7 @@ mod tests {
             .unwrap();
         let member_id = member.id().to_owned();
         let group = owner
-            .atomic(|app| app.create_group(name.to_owned(), vec![member_id]))
+            .atomic(|app| app.create_direct(name.to_owned(), member_id))
             .unwrap();
         member
             .handle(
@@ -164,7 +164,7 @@ mod tests {
         let mut owner = profile(directory.path(), "owner");
         for name in ["one", "two", "three"] {
             owner
-                .atomic(|app| app.create_group(name.to_owned(), Vec::new()))
+                .atomic(|app| app.create_conversation(name.to_owned(), Vec::new()))
                 .unwrap();
         }
         let time = now();
@@ -399,7 +399,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut owner = profile(directory.path(), "owner");
         let group = owner
-            .atomic(|app| app.create_group("rollback".into(), Vec::new()))
+            .atomic(|app| app.create_conversation("rollback".into(), Vec::new()))
             .unwrap();
         let before_crypto = owner.crypto.snapshot().unwrap();
         let before_state = serde_json::to_vec(&owner.state).unwrap();

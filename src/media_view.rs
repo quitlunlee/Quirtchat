@@ -260,10 +260,7 @@ impl MediaView {
                 self.close();
                 return;
             }
-            let title = format!(
-                " {}  ·  image preview  ·  Esc to close",
-                crate::safe(&image.name)
-            );
+            let title = format!(" {}", crate::safe(&image.name));
             frame.render_widget(
                 Paragraph::new(title).style(Style::default().fg(Color::Rgb(218, 224, 236))),
                 Rect::new(inner.x, inner.y, inner.width, 1),
@@ -284,10 +281,7 @@ impl MediaView {
                     Line::from(crate::safe(&playback.name)),
                     Line::from(""),
                     Line::from("mpv was not found on PATH."),
-                    Line::from("Press O to open with your system media app, or Esc to cancel."),
-                    Line::from(
-                        "The system app manages its own cache; CLIChat removes its temporary file at expiry.",
-                    ),
+                    Line::from("[ Open externally ]"),
                 ]
             } else {
                 let name = self
@@ -307,7 +301,6 @@ impl MediaView {
                         "Preparing encrypted media…  {}/{} chunks",
                         self.progress, chunks
                     )),
-                    Line::from("Downloading only on request. Esc returns to the conversation."),
                 ]
             };
             frame.render_widget(
@@ -492,7 +485,6 @@ pub(crate) async fn play_terminal(playback: Playback, player: &Path) -> Result<S
         .kill_on_drop(true)
         .spawn()
         .context("could not start mpv")?;
-    println!("CLIChat media · q to stop · Ctrl-C returns to chat · expires with its message");
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     loop {
         tokio::select! {

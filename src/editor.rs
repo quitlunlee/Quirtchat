@@ -162,21 +162,15 @@ impl Editor {
             self.clear();
             return if empty { Action::Quit } else { Action::None };
         }
+        if control && matches!(key.code, KeyCode::Char('s' | 'S')) {
+            return self.submit();
+        }
         if key.code == KeyCode::Enter {
             self.operator = None;
-            if control || alt {
-                if self.mode == Mode::Normal {
-                    self.begin_insert();
-                }
+            if self.mode == Mode::Insert {
                 self.insert_fragment("\n", true);
-                return Action::None;
             }
-            if self.text.trim().is_empty() {
-                return Action::None;
-            }
-            let text = std::mem::take(&mut self.text);
-            self.clear();
-            return Action::Submit(text);
+            return Action::None;
         }
         if key.code == KeyCode::Esc {
             if self.mode == Mode::Insert && self.cursor > self.line_start() {
@@ -204,6 +198,16 @@ impl Editor {
             Mode::Insert => self.insert_key(key.code),
             Mode::Normal => self.normal_key(key.code),
         }
+    }
+
+    /// Submission is explicit; pasted commands and newlines always remain text.
+    pub fn submit(&mut self) -> Action {
+        if self.text.trim().is_empty() {
+            return Action::None;
+        }
+        let text = std::mem::take(&mut self.text);
+        self.clear();
+        Action::Submit(text)
     }
 
     fn insert_key(&mut self, key: KeyCode) -> Action {
@@ -660,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn starts_normal_and_enter_submits_without_retaining_register_or_undo() {
+    fn starts_normal_and_control_s_submits_without_retaining_register_or_undo() {
         let mut editor = Editor::new();
         assert_eq!(editor.mode(), Mode::Normal);
         assert_eq!(key(&mut editor, KeyCode::Char('j')), Action::Scroll(1));
@@ -668,7 +672,7 @@ mod tests {
         key(&mut editor, KeyCode::Esc);
         normal(&mut editor, "yy");
         assert_eq!(
-            key(&mut editor, KeyCode::Enter),
+            editor.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::Submit("hello".into())
         );
         assert_eq!(editor.mode(), Mode::Normal);
@@ -687,22 +691,19 @@ mod tests {
     }
 
     #[test]
-    fn paste_is_literal_and_modified_enter_only_inserts_newlines() {
+    fn paste_is_literal_enter_inserts_newlines_and_control_s_submits() {
         let mut editor = Editor::new();
         assert!(editor.insert_text("/quit\r\n你好\u{1b}\0"));
         assert_eq!(editor.text(), "/quit\n你好");
         assert_eq!(editor.mode(), Mode::Insert);
-        assert_eq!(
-            editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
-            Action::None
-        );
+        assert_eq!(key(&mut editor, KeyCode::Enter), Action::None);
         assert_eq!(
             editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             Action::None
         );
         assert_eq!(editor.text(), "/quit\n你好\n\n");
         assert_eq!(
-            key(&mut editor, KeyCode::Enter),
+            editor.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::Submit("/quit\n你好\n\n".into())
         );
     }

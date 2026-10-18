@@ -7,6 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "routing.rs"]
+mod routing;
+use routing::RouteQuality;
+
 const BATCH: usize = 4;
 const MAX_LOCAL_MAILBOXES: usize = 12;
 const MAX_DEFERRED_MESSAGES: usize = 256;
@@ -25,6 +29,7 @@ struct Schedule {
     retries: BTreeMap<String, Retry>,
     acknowledgements: BTreeMap<String, Vec<String>>,
     announced: BTreeMap<String, u64>,
+    routes: RouteQuality,
 }
 
 #[derive(Default)]
@@ -149,17 +154,25 @@ fn mailbox_key(mailbox: &Mailbox) -> Result<String> {
     ))
 }
 
-fn current_node_ticket<'a>(state: &'a AppState, ticket: &'a str) -> &'a str {
+pub(super) fn current_node_ticket<'a>(state: &'a AppState, ticket: &'a str) -> &'a str {
     let Ok(node) = ticket_endpoint_id(ticket) else {
         return ticket;
     };
-    // Only verified contact descriptors may update an established storage route.
-    // Unauthenticated PEX entries remain candidates for new allocations.
+    // Verified contacts and explicitly trusted server addresses can refresh an
+    // established endpoint's route. PEX cannot replace an authorized route.
     state
         .contacts
         .values()
         .find(|contact| ticket_endpoint_id(&contact.ticket).ok().as_deref() == Some(node.as_str()))
-        .map_or(ticket, |contact| contact.ticket.as_str())
+        .map(|contact| contact.ticket.as_str())
+        .or_else(|| {
+            state
+                .group_servers
+                .iter()
+                .find(|server| ticket_endpoint_id(server).ok().as_deref() == Some(node.as_str()))
+                .map(String::as_str)
+        })
+        .unwrap_or(ticket)
 }
 
 fn refresh_mailbox_tickets(app: &mut App) -> Result<()> {
@@ -265,8 +278,9 @@ fn select_fetch(app: &App, schedule: &mut Schedule) -> Vec<Job> {
     jobs
 }
 
-fn request_conversation(request: &Request) -> Option<&str> {
+pub(super) fn request_conversation(request: &Request) -> Option<&str> {
     match request {
+        Request::HostedControl { record } => Some(&record.group_id),
         Request::Join { conversation, .. } => Some(&conversation.id),
         Request::Control { record } => Some(&record.conversation),
         Request::Sync { conversation, .. }
@@ -280,11 +294,10 @@ fn request_conversation(request: &Request) -> Option<&str> {
     }
 }
 
-fn pending_heads(pending: &[Pending]) -> Vec<usize> {
+fn pending_heads<'a>(pending: impl IntoIterator<Item = (usize, &'a Pending)>) -> Vec<usize> {
     let mut seen = BTreeSet::new();
     pending
-        .iter()
-        .enumerate()
+        .into_iter()
         .filter_map(|(index, item)| {
             seen.insert((item.recipient.as_str(), request_conversation(&item.request)))
                 .then_some(index)
@@ -305,7 +318,14 @@ fn select_pending(app: &App, schedule: &mut Schedule) -> Vec<Job> {
     let mut nodes = BTreeSet::new();
     // Preserve order within each conversation, without letting one broken group
     // prevent the same recipient from receiving control traffic for other groups.
-    let heads = pending_heads(&app.state.pending);
+    let heads = pending_heads(app.state.pending.iter().enumerate().filter(|(_, pending)| {
+        // Hosted controls use the independent server. Authorized plaintext history
+        // stays on the direct owner channel and must not queue behind those controls.
+        matches!(pending.request, Request::History { .. })
+            || !request_conversation(&pending.request)
+                .and_then(|id| app.state.conversations.get(id))
+                .is_some_and(|group| group.server.is_some())
+    }));
     for index in schedule.order(1, heads.len()) {
         let pending = &app.state.pending[heads[index]];
         let Some(contact) = app.state.contacts.get(&pending.recipient) else {
@@ -341,7 +361,11 @@ fn select_sync(app: &App, schedule: &mut Schedule) -> Vec<Job> {
         .state
         .conversations
         .values()
-        .filter(|group| group.active && !app.state.recovery_pending.contains(&group.id))
+        .filter(|group| {
+            group.active
+                && group.server.is_none()
+                && !app.state.recovery_pending.contains(&group.id)
+        })
         .collect();
     for index in schedule.order(2, groups.len()) {
         let group = groups[index];
@@ -392,6 +416,16 @@ fn select_outbox(app: &App, schedule: &mut Schedule) -> Vec<Job> {
     let mut recipients = BTreeSet::new();
     for index in schedule.order(3, app.state.outbox.len()) {
         let item = &app.state.outbox[index];
+        // Hosted groups publish once through group_delivery_tick, never through
+        // recipient contact routes or cooperative private-message mailboxes.
+        if app
+            .state
+            .conversations
+            .get(&item.envelope.conversation)
+            .is_some_and(|group| group.server.is_some())
+        {
+            continue;
+        }
         if recipients.contains(&item.recipient) {
             continue;
         }
@@ -404,29 +438,65 @@ fn select_outbox(app: &App, schedule: &mut Schedule) -> Vec<Job> {
         let recipient = &item.recipient;
         let message = &item.envelope.id;
         let before = jobs.len();
-        add_job(
-            &mut jobs,
-            &mut nodes,
-            schedule,
-            &contact.ticket,
-            format!("deliver:{recipient}:{message}"),
-            Request::Deliver {
-                envelope: item.envelope.clone(),
-            },
-            Kind::Deliver {
-                recipient: recipient.clone(),
-                message: message.clone(),
-            },
-        );
-        if jobs.len() == before {
+        // Prepare cache routes before direct delivery: a known healthy cache can
+        // accept the first copy immediately even while the recipient is offline.
+        let candidates = {
             // Only locations advertised by the recipient may receive the ciphertext.
+            // Multiple mailbox IDs on one endpoint still count as one replica.
+            let stored_nodes: BTreeSet<_> = item
+                .stored_at
+                .iter()
+                .filter_map(|key| key.split_once('/').map(|(node, _)| node))
+                .collect();
+            let mut candidate_nodes = BTreeSet::new();
+            let mut candidates = Vec::new();
             for mailbox in &contact.mailboxes {
                 let Ok(key) = mailbox_key(mailbox) else {
                     continue;
                 };
-                if item.stored_at.contains(&key) {
+                let Ok(node) = ticket_endpoint_id(&mailbox.node_ticket) else {
+                    continue;
+                };
+                if item.stored_at.contains(&key)
+                    || stored_nodes.contains(node.as_str())
+                    || nodes.contains(&node)
+                    || !schedule.ready(&format!("node:{node}"))
+                    || !schedule.ready(&format!("store:{recipient}:{message}:{key}"))
+                    || !candidate_nodes.insert(node.clone())
+                {
                     continue;
                 }
+                candidates.push((mailbox, key, node));
+            }
+            candidates
+        };
+        let direct_node = ticket_endpoint_id(&contact.ticket).unwrap_or_default();
+        let prefer_cache = candidates
+            .iter()
+            .any(|(_, _, node)| schedule.routes.prefer_cache(node, &direct_node));
+        if !prefer_cache {
+            add_job(
+                &mut jobs,
+                &mut nodes,
+                schedule,
+                &contact.ticket,
+                format!("deliver:{recipient}:{message}"),
+                Request::Deliver {
+                    envelope: item.envelope.clone(),
+                },
+                Kind::Deliver {
+                    recipient: recipient.clone(),
+                    message: message.clone(),
+                },
+            );
+        }
+        if prefer_cache || jobs.len() == before {
+            let route_nodes: Vec<_> = candidates
+                .iter()
+                .map(|(_, _, node)| node.as_str())
+                .collect();
+            if let Some(index) = schedule.routes.choose(recipient, &route_nodes) {
+                let (mailbox, key, _) = &candidates[index];
                 add_job(
                     &mut jobs,
                     &mut nodes,
@@ -441,12 +511,9 @@ fn select_outbox(app: &App, schedule: &mut Schedule) -> Vec<Job> {
                     Kind::Store {
                         recipient: recipient.clone(),
                         message: message.clone(),
-                        mailbox: key,
+                        mailbox: key.clone(),
                     },
                 );
-                if jobs.len() != before {
-                    break;
-                }
             }
         }
         if jobs.len() != before {
@@ -488,37 +555,54 @@ fn select_discovery(app: &App, schedule: &mut Schedule, discover: bool) -> Vec<J
         .state
         .mailboxes
         .iter()
-        .find(|mailbox| mailbox.retired_at.is_none() && schedule.replaceable(mailbox))
+        .find(|mailbox| {
+            mailbox.retired_at.is_none()
+                && schedule.replaceable(mailbox)
+                && !app.state.personal_mailbox.as_ref().is_some_and(|personal| {
+                    personal.mailbox_id == mailbox.public.mailbox_id
+                        && ticket_endpoint_id(&mailbox.public.node_ticket)
+                            .ok()
+                            .as_ref()
+                            == Some(&personal.node)
+                })
+        })
         .and_then(|mailbox| mailbox_key(&mailbox.public).ok());
     if discover
         && app.state.mailboxes.len() < MAX_LOCAL_MAILBOXES
         && (active < 3 || replace.is_some())
     {
+        let mut candidates = Vec::new();
         for index in schedule.order(4, peers.len()) {
             let ticket = &peers[index];
-            let node = ticket_endpoint_id(ticket).ok();
-            if app
-                .state
-                .mailboxes
-                .iter()
-                .any(|mailbox| ticket_endpoint_id(&mailbox.public.node_ticket).ok() == node)
+            let Ok(node) = ticket_endpoint_id(ticket) else {
+                continue;
+            };
+            if app.state.mailboxes.iter().any(|mailbox| {
+                ticket_endpoint_id(&mailbox.public.node_ticket)
+                    .ok()
+                    .as_ref()
+                    == Some(&node)
+            }) || !schedule.ready(&format!("node:{node}"))
+                || !schedule.ready(&format!("allocate:{node}"))
             {
                 continue;
             }
+            candidates.push((ticket, node));
+        }
+        let route_nodes: Vec<_> = candidates.iter().map(|(_, node)| node.as_str()).collect();
+        if let Some(index) = schedule.routes.choose("allocate", &route_nodes) {
+            let (ticket, node) = &candidates[index];
             add_job(
                 &mut jobs,
                 &mut nodes,
                 schedule,
                 ticket,
-                format!("allocate:{}", node.unwrap_or_default()),
+                format!("allocate:{node}"),
                 Request::Allocate,
                 Kind::Allocate {
                     replace: replace.clone(),
                 },
             );
-            if !jobs.is_empty() {
-                break;
-            }
         }
     }
     // Newly signed descriptors are announced even on ticks that don't perform PEX.
@@ -604,10 +688,28 @@ async fn run_job(
         job.ticket = current_node_ticket(&app.state, &job.ticket).to_owned();
     }
     // No state or scheduler lock is held while awaiting the network.
+    let started = Instant::now();
     let response = transport.request(&job.ticket, job.request.clone()).await;
+    let elapsed = started.elapsed();
     let network_failed = response.is_err();
     let result = response.and_then(|response| apply_response(shared, runtime, &job, response));
     let mut schedule = runtime.schedule.lock().unwrap();
+    // Application-level MLS/authorization failures do not establish cache health.
+    // Cache operations and transport failures do; PEX contributes only measured RPC
+    // behavior, never a score supplied by another node.
+    if network_failed
+        || matches!(
+            job.kind,
+            Kind::Allocate { .. }
+                | Kind::Fetch(_)
+                | Kind::Delete { .. }
+                | Kind::Store { .. }
+                | Kind::Peers
+        )
+        || (result.is_ok() && matches!(job.kind, Kind::Deliver { .. }))
+    {
+        schedule.routes.observe(&job.node, elapsed, result.is_ok());
+    }
     match result {
         Ok(cooldown) => {
             schedule.succeeded(job.key, cooldown);
@@ -653,11 +755,13 @@ fn apply_response(
                 if app.atomic(|app| app.receive(envelope.clone())).is_ok() {
                     ids.push(id);
                 } else {
-                    // Persist the ciphertext before acknowledging the remote copy. Missing
-                    // group epochs are retried after sync instead of blocking the first page.
-                    let evicted = app.atomic(|app| defer_envelope(&mut app.state, envelope))?;
-                    if evicted {
-                        app.status = "Deferred inbox full; oldest ciphertext evicted".into();
+                    // A remote copy can be deleted only while a durable local copy remains.
+                    // When missing epochs fill the inbox, leave this item on the relay.
+                    // Later items in the same bounded page may already be decryptable.
+                    let retained = app.atomic(|app| defer_envelope(&mut app.state, envelope))?;
+                    if !retained {
+                        app.status = "Deferred inbox full; waiting messages kept on relay".into();
+                        continue;
                     }
                     ids.push(id);
                 }
@@ -949,7 +1053,7 @@ fn apply_response(
                     && hex::decode(&mailbox_id).is_ok()
                     && hex::decode(&write_token).is_ok()
                     && hex::decode(&read_token).is_ok()
-                    && read_token != write_token,
+                    && !read_token.eq_ignore_ascii_case(&write_token),
                 "invalid mailbox capabilities"
             );
             shared.lock().unwrap().atomic(|app| {
@@ -972,6 +1076,18 @@ fn apply_response(
                     .filter(|mailbox| mailbox.retired_at.is_none())
                     .count();
                 if active >= 3 {
+                    // The user may pin a mailbox while allocation is in flight.
+                    let protected = app
+                        .state
+                        .personal_mailbox
+                        .as_ref()
+                        .map(|personal| format!("{}/{}", personal.node, personal.mailbox_id));
+                    ensure!(
+                        protected
+                            .as_ref()
+                            .is_none_or(|key| replace.as_ref() != Some(key)),
+                        "personal mailbox cannot be replaced automatically"
+                    );
                     let old = app
                         .state
                         .mailboxes
@@ -1006,6 +1122,9 @@ pub async fn synchronize(shared: &Shared, transport: &Transport) {
     let Ok(_guard) = runtime.gate.try_lock() else {
         return;
     };
+    if let Err(error) = super::group_delivery_tick(shared, transport).await {
+        shared.lock().unwrap().status = format!("Hosted groups: {error}");
+    }
     let jobs = {
         let app = shared.lock().unwrap();
         select_sync(&app, &mut runtime.schedule.lock().unwrap())
@@ -1053,9 +1172,14 @@ pub async fn network_tick(shared: &Shared, transport: &Transport, discover: bool
             time.saturating_duration_since(retry.due) < Duration::from_secs(3600)
         });
     }
-    // Each category gets a bounded turn even when earlier nodes are offline. Four
-    // background RPCs leave transport permits for inbound application requests.
-    for category in 0..5 {
+    // Service hosted groups before direct peers whose connection attempts may time out.
+    if let Err(error) = super::group_delivery_tick(shared, transport).await {
+        shared.lock().unwrap().status = format!("Hosted groups: {error}");
+    }
+    // Persist outgoing copies before an offline peer's sync can consume its whole
+    // timeout. Each category still gets one bounded turn; four background RPCs
+    // leave transport permits for inbound application requests.
+    for category in [3, 0, 1, 2, 4] {
         let jobs = {
             let app = shared.lock().unwrap();
             let mut schedule = runtime.schedule.lock().unwrap();
@@ -1096,42 +1220,32 @@ fn deferred_size(envelope: &Envelope) -> usize {
         .saturating_add(256)
 }
 
-fn defer_envelope(state: &mut AppState, envelope: Envelope) -> Result<bool> {
+/// Returns whether this exact ciphertext is retained and can be acknowledged.
+pub(super) fn defer_envelope(state: &mut AppState, envelope: Envelope) -> Result<bool> {
     envelope.validate(now())?;
     if state
         .deferred
         .iter()
         .any(|known| same_envelope(known, &envelope))
     {
-        return Ok(false);
+        return Ok(true);
     }
     let size = deferred_size(&envelope);
     ensure!(
         size <= MAX_DEFERRED_BYTES,
         "deferred envelope exceeds capacity"
     );
-    let mut total = state.deferred.iter().map(deferred_size).sum::<usize>();
-    let mut evicted = false;
-    while state.deferred.len() >= MAX_DEFERRED_MESSAGES
+    let total = state.deferred.iter().map(deferred_size).sum::<usize>();
+    if state.deferred.len() >= MAX_DEFERRED_MESSAGES
         || total.saturating_add(size) > MAX_DEFERRED_BYTES
     {
-        let Some(index) = state
-            .deferred
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, item)| item.expires_at)
-            .map(|(index, _)| index)
-        else {
-            break;
-        };
-        total = total.saturating_sub(deferred_size(&state.deferred.remove(index)));
-        evicted = true;
+        return Ok(false);
     }
     state.deferred.push(envelope);
-    Ok(evicted)
+    Ok(true)
 }
 
-fn retry_deferred(app: &mut App) -> Result<()> {
+pub(super) fn retry_deferred(app: &mut App) -> Result<()> {
     let count = app.state.deferred.len().min(BATCH);
     for _ in 0..count {
         let Some(envelope) = app.state.deferred.first().cloned() else {
@@ -1165,12 +1279,20 @@ fn retry_deferred(app: &mut App) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../tests/transport/deferred_inbox.rs"]
+mod deferred_inbox;
+
+#[cfg(test)]
+#[path = "../tests/transport/routing_selection.rs"]
+mod routing_selection;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn pending_selection_keeps_per_recipient_and_conversation_fifo() {
-        let pending = vec![
+        let pending = [
             Pending {
                 recipient: "offline".into(),
                 request: Request::History {
@@ -1205,7 +1327,7 @@ mod tests {
                 request: Request::Allocate,
             },
         ];
-        assert_eq!(pending_heads(&pending), vec![0, 2, 3, 4]);
+        assert_eq!(pending_heads(pending.iter().enumerate()), vec![0, 2, 3, 4]);
     }
 
     #[test]
@@ -1267,8 +1389,8 @@ mod tests {
     fn deferred_rejects_invalid_input_and_deduplicates_only_exact_ciphertext() {
         let mut state = AppState::default();
         let first = envelope(1, 8);
-        assert!(!defer_envelope(&mut state, first.clone()).unwrap());
-        assert!(!defer_envelope(&mut state, first.clone()).unwrap());
+        assert!(defer_envelope(&mut state, first.clone()).unwrap());
+        assert!(defer_envelope(&mut state, first.clone()).unwrap());
         assert_eq!(state.deferred.len(), 1);
         let mut changed = first.clone();
         changed.ciphertext[0] = 0;
@@ -1285,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_capacity_evicts_earliest_expiry_and_bounds_serialized_bytes() {
+    fn deferred_capacity_preserves_accepted_messages_and_bounds_serialized_bytes() {
         let mut state = AppState::default();
         for id in 0..MAX_DEFERRED_MESSAGES {
             let mut item = envelope(id, 1);
@@ -1293,20 +1415,36 @@ mod tests {
                 item.created_at -= 100;
                 item.expires_at -= 100;
             }
-            assert!(!defer_envelope(&mut state, item).unwrap());
+            assert!(defer_envelope(&mut state, item).unwrap());
         }
-        assert!(defer_envelope(&mut state, envelope(999, 1)).unwrap());
+        let before = serde_json::to_vec(&state.deferred).unwrap();
+        assert!(!defer_envelope(&mut state, envelope(999, 1)).unwrap());
         assert_eq!(state.deferred.len(), MAX_DEFERRED_MESSAGES);
-        assert!(!state.deferred.iter().any(|item| item.id == "17"));
-        assert!(state.deferred.iter().any(|item| item.id == "0"));
+        assert_eq!(serde_json::to_vec(&state.deferred).unwrap(), before);
+        let duplicate = state.deferred[17].clone();
+        assert!(defer_envelope(&mut state, duplicate).unwrap());
 
         state.deferred.clear();
         for id in 0..32 {
-            defer_envelope(&mut state, envelope(id, 128 * 1024)).unwrap();
+            let before = serde_json::to_vec(&state.deferred).unwrap();
+            if !defer_envelope(&mut state, envelope(id, 128 * 1024)).unwrap() {
+                assert_eq!(serde_json::to_vec(&state.deferred).unwrap(), before);
+            }
         }
         assert!(state.deferred.len() < 32);
+        assert_eq!(state.deferred.first().unwrap().id, "0");
         assert!(state.deferred.iter().map(deferred_size).sum::<usize>() <= MAX_DEFERRED_BYTES);
         assert!(serde_json::to_vec(&state.deferred).unwrap().len() <= MAX_DEFERRED_BYTES);
+
+        let expiry = state
+            .deferred
+            .iter()
+            .map(|item| item.expires_at)
+            .max()
+            .unwrap();
+        state.purge_expired(expiry);
+        assert!(state.deferred.is_empty());
+        assert!(defer_envelope(&mut state, envelope(999, 128 * 1024)).unwrap());
     }
 
     #[test]

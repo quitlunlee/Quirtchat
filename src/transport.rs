@@ -446,14 +446,17 @@ async fn read_frame<T: DeserializeOwned>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    async fn local_transport(secret: [u8; 32], limits: TransportLimits) -> Result<Transport> {
+    pub(crate) async fn local_transport(
+        secret: [u8; 32],
+        limits: TransportLimits,
+    ) -> Result<Transport> {
         Transport::from_builder(
             base_builder(secret)
                 .clear_ip_transports()
@@ -464,7 +467,7 @@ mod tests {
         .await
     }
 
-    pub(super) async fn local_ticket(transport: &Transport) -> Result<String> {
+    pub(crate) async fn local_ticket(transport: &Transport) -> Result<String> {
         for _ in 0..100 {
             if let Ok(ticket) = transport.ticket() {
                 return Ok(ticket);
@@ -579,3 +582,11 @@ mod closed_loop;
 #[cfg(test)]
 #[path = "../tests/transport/media_loop.rs"]
 mod media_loop;
+
+#[cfg(test)]
+#[path = "../tests/transport/personal_mailbox.rs"]
+mod personal_mailbox;
+
+#[cfg(test)]
+#[path = "../tests/transport/hosted_group.rs"]
+mod hosted_group;

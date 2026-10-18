@@ -245,6 +245,7 @@ impl App {
 
     pub fn load(store: Store) -> Result<Self> {
         let mut state = store.load_state()?.context("profile is not initialized")?;
+        state.normalize_contact_names();
         let crypto = CryptoEngine::from_snapshot(&state.crypto)?;
         let secret: [u8; 32] = state.identity_secret.as_slice().try_into()?;
         ensure!(
@@ -261,6 +262,18 @@ impl App {
             ticket: String::new(),
             status: "Starting".into(),
         };
+        // A legacy snapshot proves only its current MLS membership. Do not infer
+        // audiences for already stored messages or for any older epoch.
+        let owned: Vec<_> = app
+            .state
+            .conversations
+            .values()
+            .filter(|group| group.active && group.owner == app.id())
+            .map(|group| group.id.clone())
+            .collect();
+        for id in owned {
+            app.record_history_epoch(&id)?;
+        }
         app.save()?;
         Ok(app)
     }
@@ -270,7 +283,9 @@ impl App {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        self.state.normalize_contact_names();
         self.state.purge_expired(now());
+        self.maintain_key_packages(now())?;
         self.crypto.prune_expired_secrets()?;
         ensure!(
             serde_json::to_vec(&self.state.pending)?.len() <= 32 * 1024 * 1024,
@@ -334,7 +349,7 @@ impl App {
     pub fn import_contact(&mut self, invitation: Invitation) -> Result<String> {
         verify_invitation(&invitation)?;
         ensure!(
-            CryptoEngine::key_package_identity(&invitation.contact.key_package)?
+            CryptoEngine::contact_key_package_identity(&invitation.contact.key_package)?
                 == invitation.contact.id,
             "key package identity mismatch"
         );
@@ -354,17 +369,68 @@ impl App {
             ensure!(contact.version >= old.version, "stale contact descriptor");
         }
         let id = contact.id.clone();
+        // Refreshing key packages or peer metadata must never rename a local contact.
+        self.state.normalize_contact_names();
         self.state.contacts.insert(id.clone(), contact.clone());
         self.state.invitations.insert(id.clone(), invitation);
+        self.state.normalize_contact_names();
         Ok(id)
     }
 
+    /// Import a signed invitation and optionally assign a local remark. An empty
+    /// remark retains an existing name, or uses the remote display name for a new contact.
+    /// Call through `atomic` when the result must be persisted.
+    pub fn import_contact_named(&mut self, invitation: Invitation, remark: &str) -> Result<String> {
+        let remark = remark.trim();
+        ensure!(
+            remark.is_empty() || valid_contact_name(remark),
+            "invalid contact remark"
+        );
+        let id = self.import_contact(invitation)?;
+        if !remark.is_empty() {
+            self.state.set_contact_name(&id, remark);
+        }
+        Ok(id)
+    }
+
+    pub fn contact_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.state
+            .contact_names
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| {
+                self.state
+                    .contacts
+                    .get(id)
+                    .map(|contact| contact.name.as_str())
+            })
+            .unwrap_or(id)
+    }
+
+    /// UI commands use exact local names, including spaces, without ID-prefix guessing.
+    pub fn resolve_contact_name_exact(&self, name: &str) -> Result<String> {
+        let mut matches = self
+            .state
+            .contacts
+            .keys()
+            .filter(|id| self.contact_name(id) == name);
+        let id = matches.next().context("contact name not found")?;
+        ensure!(matches.next().is_none(), "contact name is ambiguous");
+        Ok(id.clone())
+    }
+
     pub fn resolve_contact(&self, query: &str) -> Result<String> {
+        if self.state.contacts.contains_key(query) {
+            return Ok(query.to_owned());
+        }
+        if let Ok(id) = self.resolve_contact_name_exact(query) {
+            return Ok(id);
+        }
         let matches: Vec<_> = self
             .state
             .contacts
             .values()
-            .filter(|c| c.id == query || c.name == query || c.id.starts_with(query))
+            .filter(|c| c.id.starts_with(query))
             .collect();
         ensure!(
             matches.len() == 1,
@@ -384,7 +450,11 @@ impl App {
         Ok(matches[0].id.clone())
     }
 
-    pub fn create_group(&mut self, name: String, members: Vec<String>) -> Result<String> {
+    pub fn create_direct(&mut self, name: String, member: String) -> Result<String> {
+        self.create_conversation(name, vec![member])
+    }
+
+    fn create_conversation(&mut self, name: String, members: Vec<String>) -> Result<String> {
         ensure!(
             !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control),
             "invalid group name"
@@ -408,8 +478,10 @@ impl App {
                 members: vec![self.id().into()],
                 epoch: 0,
                 active: true,
+                server: None,
             },
         );
+        self.record_history_epoch(&id)?;
         for member in members {
             self.add_member(&id, &member)?;
         }
@@ -439,6 +511,23 @@ impl App {
             "only the active group owner can do this"
         );
         Ok(group.clone())
+    }
+
+    /// Only MLS state verified locally can establish a history audience. Keep
+    /// enough snapshots for every past epoch for which we retain decrypting keys.
+    fn record_history_epoch(&mut self, id: &str) -> Result<()> {
+        let epoch = self.crypto.epoch(id)?;
+        let members = self.crypto.members(id)?;
+        let epochs = self
+            .state
+            .history_epoch_members
+            .entry(id.into())
+            .or_default();
+        epochs.insert(epoch, members);
+        while epochs.len() > crate::crypto::PAST_EPOCHS + 1 {
+            epochs.pop_first();
+        }
+        Ok(())
     }
 
     fn record_commit(
@@ -484,11 +573,17 @@ impl App {
             .context("unknown conversation")?;
         group.epoch = self.crypto.epoch(id)?;
         group.members = self.crypto.members(id)?;
+        self.record_history_epoch(id)?;
+        self.stage_hosted_group(id)?;
         Ok(())
     }
 
     pub fn add_member(&mut self, id: &str, member: &str) -> Result<()> {
         let before = self.owner_group(id)?;
+        ensure!(
+            before.server.is_some() || before.members.len() < 2,
+            "host this conversation on a group server before adding more members"
+        );
         ensure!(
             before.members.len() < MAX_GROUP_MEMBERS && !before.members.iter().any(|m| m == member),
             "member exists or group is full"
@@ -515,6 +610,7 @@ impl App {
                 contacts,
             },
         });
+        self.stage_hosted_group(id)?;
         Ok(())
     }
 
@@ -555,11 +651,21 @@ impl App {
             .clone();
         ensure!(group.active, "you are no longer a member");
         ensure!(
+            group.server.is_some() || group.members.len() <= 2,
+            "this legacy group needs a server; its owner must run group host first"
+        );
+        ensure!(
             !self.state.recovery_pending.iter().any(|g| g == id),
             "key recovery is in progress; wait for the owner before sending"
         );
         ensure!(
-            self.state.outbox.len() + group.members.len().saturating_sub(1) <= 10_000,
+            self.state.outbox.len()
+                + if group.server.is_some() {
+                    1
+                } else {
+                    group.members.len().saturating_sub(1)
+                }
+                <= 10_000,
             "outbox is full"
         );
         let message = ChatMessage {
@@ -590,9 +696,19 @@ impl App {
             ciphertext,
         };
         let own = self.id().to_string();
-        for recipient in group.members.iter().filter(|m| **m != own) {
+        let recipients: Vec<_> = if group.server.is_some() {
+            vec![group.id.clone()]
+        } else {
+            group
+                .members
+                .iter()
+                .filter(|member| **member != own)
+                .cloned()
+                .collect()
+        };
+        for recipient in recipients {
             self.state.outbox.push(Outgoing {
-                recipient: recipient.clone(),
+                recipient,
                 envelope: envelope.clone(),
                 stored_at: vec![],
             });
@@ -601,6 +717,10 @@ impl App {
         self.state.message_signatures.insert(
             format!("{}/{}", message.conversation, message.id),
             signature,
+        );
+        self.state.history_audiences.insert(
+            format!("{}/{}", message.conversation, message.id),
+            self.crypto.members(&message.conversation)?,
         );
         self.state.messages.push(message);
         Ok(id)
@@ -647,6 +767,21 @@ impl App {
                     format!("{}/{}", message.conversation, message.id),
                     signed.signature,
                 );
+                // The wire epoch is trusted only after MLS authentication and
+                // signed-content validation above. Current membership must never
+                // substitute for an unknown delayed message's older audience.
+                let epoch = CryptoEngine::message_epoch(&envelope.ciphertext)?;
+                if let Some(members) = self
+                    .state
+                    .history_epoch_members
+                    .get(&group.id)
+                    .and_then(|epochs| epochs.get(&epoch))
+                {
+                    self.state.history_audiences.insert(
+                        format!("{}/{}", message.conversation, message.id),
+                        members.clone(),
+                    );
+                }
                 self.state.messages.push(message);
             }
             _ => bail!("control messages cannot use the chat mailbox"),
@@ -756,6 +891,17 @@ impl App {
 
     pub fn handle(&mut self, peer: &str, request: Request) -> Result<Response> {
         match request {
+            Request::HostedControl { record } => {
+                ensure!(
+                    self.known_peer(peer)? == record.sender,
+                    "hosted control peer mismatch"
+                );
+                self.accept_hosted_control(record)?;
+                Ok(Response::Ok)
+            }
+            Request::Server(_) => {
+                bail!("this endpoint is a client; configure an independent server")
+            }
             Request::BlobPut {
                 mailbox_id,
                 write_token,
@@ -851,25 +997,7 @@ impl App {
             }
             Request::KeyPackage { request_id } => {
                 let sender = self.known_peer(peer)?;
-                ensure!(
-                    request_id.len() <= 64 && !request_id.is_empty(),
-                    "invalid package request"
-                );
-                let key = format!("{sender}/{request_id}");
-                if let Some(invitation) = self.state.issued_packages.get(&key) {
-                    return Ok(Response::Hello(invitation.clone()));
-                }
-                ensure!(
-                    self.state.issued_packages.len() < 256,
-                    "key package issuance limit reached"
-                );
-                self.atomic(|app| {
-                    app.state.key_package = app.crypto.key_package()?;
-                    app.state.contact_version += 1;
-                    let invitation = app.invitation()?;
-                    app.state.issued_packages.insert(key, invitation.clone());
-                    Ok(Response::Hello(invitation))
-                })
+                self.issue_key_package(&sender, &request_id, now())
             }
             Request::Deliver { envelope } => {
                 self.known_peer(peer)?;
@@ -1044,6 +1172,11 @@ impl App {
                         m.conversation == conversation
                             && m.expires_at > now()
                             && after.as_ref().is_none_or(|a| &m.id > a)
+                            && self
+                                .state
+                                .history_audiences
+                                .get(&format!("{}/{}", m.conversation, m.id))
+                                .is_some_and(|members| members.contains(&sender))
                     })
                     .collect::<Vec<_>>();
                 available.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1206,6 +1339,14 @@ pub async fn acquire_key_package(shared: &Shared, transport: &Transport, id: &st
     }
 }
 
+#[path = "group_delivery.rs"]
+mod group_delivery;
+#[path = "key_packages.rs"]
+mod key_packages;
+pub use group_delivery::{HostedDeliveryState, group_delivery_tick};
+#[path = "personal_mailbox.rs"]
+mod personal_mailbox;
+pub use personal_mailbox::attach_personal_mailbox;
 #[path = "rekey.rs"]
 mod rekey;
 #[path = "ticker.rs"]

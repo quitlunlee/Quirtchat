@@ -9,6 +9,7 @@ use openmls::prelude::tls_codec::{
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,7 +22,7 @@ use crate::model::{MAX_FRAME_BYTES, MAX_GROUP_MEMBERS, MESSAGE_TTL};
 const SUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
 const SNAPSHOT_VERSION: u32 = 1;
 // These bounds deliberately trade unlimited reordering for bounded memory use.
-const PAST_EPOCHS: usize = 256;
+pub(crate) const PAST_EPOCHS: usize = 256;
 const OUT_OF_ORDER: u32 = 1024;
 const MAX_FORWARD: u32 = 4096;
 
@@ -184,8 +185,12 @@ impl CryptoEngine {
 
     /// Issues a fresh, single-use KeyPackage. Save the resulting snapshot before sharing it.
     pub fn key_package(&mut self) -> Result<Vec<u8>> {
+        self.key_package_with_lifetime(Lifetime::default())
+    }
+
+    pub(crate) fn key_package_with_lifetime(&mut self, lifetime: Lifetime) -> Result<Vec<u8>> {
         self.transaction(|this| {
-            let package = KeyPackage::builder().build(
+            let package = KeyPackage::builder().key_package_lifetime(lifetime).build(
                 SUITE,
                 &this.provider,
                 &this.signer,
@@ -206,6 +211,56 @@ impl CryptoEngine {
             "unsupported MLS ciphersuite"
         );
         leaf_identity(package.leaf_node())
+    }
+
+    /// A signed contact directory may outlive its one-use joining material. Only
+    /// the precise expired-lifetime error is tolerated; OpenMLS 0.9.1 verifies
+    /// both signatures and the other package fields before checking lifetime.
+    /// Group admission still uses the strict validator in `add_member`.
+    pub fn contact_key_package_identity(bytes: &[u8]) -> Result<String> {
+        ensure!(bytes.len() <= MAX_FRAME_BYTES, "KeyPackage too large");
+        let input = KeyPackageIn::tls_deserialize_exact(bytes)?;
+        let credential = input.unverified_credential();
+        let provider = OpenMlsRustCrypto::default();
+        match input.validate(provider.crypto(), ProtocolVersion::Mls10) {
+            Ok(package) => {
+                ensure!(
+                    package.ciphersuite() == SUITE,
+                    "unsupported MLS ciphersuite"
+                );
+                leaf_identity(package.leaf_node())
+            }
+            Err(KeyPackageVerifyError::LifetimeError(
+                openmls::treesync::errors::LifetimeError::Expired { .. },
+            )) => bound_identity(&credential.credential, credential.signature_key.as_slice()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn key_package_valid_until(bytes: &[u8]) -> Result<i64> {
+        ensure!(bytes.len() <= MAX_FRAME_BYTES, "KeyPackage too large");
+        let provider = OpenMlsRustCrypto::default();
+        let input = KeyPackageIn::tls_deserialize_exact(bytes)?;
+        let expires = match input.validate(provider.crypto(), ProtocolVersion::Mls10) {
+            Ok(package) => package.life_time().not_after(),
+            Err(KeyPackageVerifyError::LifetimeError(
+                openmls::treesync::errors::LifetimeError::Expired { not_after, .. },
+            )) => not_after,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(expires.try_into()?)
+    }
+
+    /// Whether the private, single-use package bundle is still waiting for a Welcome.
+    pub(crate) fn key_package_available(&self, bytes: &[u8]) -> Result<bool> {
+        let package = KeyPackageIn::tls_deserialize_exact(bytes)?
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
+        let reference = package.hash_ref(self.provider.crypto())?;
+        Ok(self
+            .provider
+            .storage()
+            .key_package::<_, KeyPackageBundle>(&reference)?
+            .is_some())
     }
 
     pub fn create_group(&mut self, id: &str) -> Result<()> {
@@ -494,6 +549,19 @@ impl CryptoEngine {
         })
     }
 
+    /// Reads routing metadata only. Callers must authenticate these exact bytes with
+    /// `process` before using this epoch for authorization decisions.
+    pub fn message_epoch(bytes: &[u8]) -> Result<u64> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= MAX_FRAME_BYTES,
+            "invalid MLS message size"
+        );
+        Ok(MlsMessageIn::tls_deserialize_exact(bytes)?
+            .try_into_protocol_message()?
+            .epoch()
+            .as_u64())
+    }
+
     /// Archive and deliver this proposal to every member before its referencing Commit.
     pub fn propose_update(&mut self, id: &str) -> Result<Vec<u8>> {
         self.transaction(|this| {
@@ -552,6 +620,30 @@ impl CryptoEngine {
         self.transaction(|this| {
             for group in this.groups.values_mut() {
                 prune_past_secrets(group, &this.provider)?;
+            }
+            // MemoryStorage uses the KeyPackage label for serialized bundles.
+            // These are local trusted records, not unverified network input.
+            let time = crate::model::now() as u64;
+            let mut storage = this
+                .provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| anyhow!("MLS storage lock poisoned"))?;
+            let expired = storage
+                .iter()
+                .filter_map(|(key, value)| {
+                    if !key.starts_with(b"KeyPackage") {
+                        return None;
+                    }
+                    let bundle: KeyPackageBundle = serde_json::from_slice(value).ok()?;
+                    (bundle.key_package().life_time().not_after() <= time).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in expired {
+                if let Some(mut value) = storage.remove(&key) {
+                    value.zeroize();
+                }
             }
             Ok(())
         })
@@ -789,6 +881,36 @@ mod tests {
         assert!(bob.join_from(&welcome, &hex::encode([0; 32])).is_err());
         bob.join_from(&welcome, alice.identity()).unwrap();
         assert!(bob.join_from(&welcome, alice.identity()).is_err());
+    }
+
+    #[test]
+    fn pruning_key_packages_preserves_unconsumed_welcome_keys() {
+        let mut alice = engine(1);
+        let mut bob = engine(2);
+        let time = crate::model::now() as u64;
+        bob.key_package_with_lifetime(Lifetime::init(time - 100, time - 1))
+            .unwrap();
+        let live_package = bob.key_package().unwrap();
+        let bundle_count = |engine: &CryptoEngine| {
+            engine
+                .provider
+                .storage()
+                .values
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.starts_with(b"KeyPackage"))
+                .count()
+        };
+        assert_eq!(bundle_count(&bob), 2);
+        bob.prune_expired_secrets().unwrap();
+        assert_eq!(bundle_count(&bob), 1);
+        bob = CryptoEngine::from_snapshot(&bob.snapshot().unwrap()).unwrap();
+        assert_eq!(bundle_count(&bob), 1);
+        assert!(bob.key_package_available(&live_package).unwrap());
+        alice.create_group("delayed-welcome").unwrap();
+        let (_, welcome) = alice.add_member("delayed-welcome", &live_package).unwrap();
+        bob.join_from(&welcome, alice.identity()).unwrap();
     }
 
     #[test]

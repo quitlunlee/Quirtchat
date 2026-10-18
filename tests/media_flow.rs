@@ -84,7 +84,7 @@ fn connect_pair(alice: &mut Profile, bob: &mut Profile) -> Result<String> {
     let bob_id = bob.app.id().to_string();
     let group = alice
         .app
-        .atomic(|app| app.create_group("Attachments".into(), vec![bob_id.clone()]))?;
+        .atomic(|app| app.create_direct("Attachments".into(), bob_id.clone()))?;
     let joins: Vec<_> = alice
         .app
         .state

@@ -21,6 +21,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
+  # SQLCipher/MLS fixtures and real RPC deadlines should not compete for CPU and disk.
+  RUST_TEST_THREADS: "1"
   RUST_BACKTRACE: "1"
   OPENSSL_STATIC: "1"
   OPENSSL_NO_VENDOR: "0"

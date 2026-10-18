@@ -101,6 +101,20 @@ pub struct Conversation {
     pub members: Vec<String>,
     pub epoch: u64,
     pub active: bool,
+    /// None is the direct-message transport. Groups bind an independent ciphertext server.
+    #[serde(default)]
+    pub server: Option<HostedGroupRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostedGroupRoute {
+    pub ticket: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalMailbox {
+    pub node: String,
+    pub mailbox_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,18 +166,28 @@ pub struct Outgoing {
     pub stored_at: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct AppState {
     pub name: String,
     pub identity_secret: Vec<u8>,
     pub transport_secret: Vec<u8>,
     pub crypto: Vec<u8>,
     pub contacts: BTreeMap<String, Contact>,
+    /// Local, unique display names. Never edit signed contact descriptors for a remark.
+    #[serde(default)]
+    pub contact_names: BTreeMap<String, String>,
     pub conversations: BTreeMap<String, Conversation>,
     pub messages: Vec<ChatMessage>,
     pub outbox: Vec<Outgoing>,
     pub controls: Vec<ControlRecord>,
     pub mailboxes: Vec<LocalMailbox>,
+    #[serde(default)]
+    pub personal_mailbox: Option<PersonalMailbox>,
+    /// Explicitly trusted group delivery endpoints, including those with pending invitations.
+    #[serde(default)]
+    pub group_servers: Vec<String>,
+    #[serde(default)]
+    pub hosted: crate::app::HostedDeliveryState,
     pub proxy: Option<String>,
     pub relay_enabled: bool,
     pub invite_token: String,
@@ -178,9 +202,18 @@ pub struct AppState {
     pub accepted_welcomes: BTreeMap<String, String>,
     pub accepted_recoveries: BTreeMap<String, String>,
     pub issued_packages: BTreeMap<String, Invitation>,
+    #[serde(default)]
+    pub issued_package_times: BTreeMap<String, IssuedPackageTime>,
     pub last_rekey: BTreeMap<String, i64>,
     pub pending_updates: BTreeMap<String, Vec<u8>>,
     pub message_signatures: BTreeMap<String, Vec<u8>>,
+    /// Locally authenticated membership snapshots, retained for delayed MLS messages.
+    #[serde(default)]
+    pub history_epoch_members: BTreeMap<String, BTreeMap<u64, Vec<String>>>,
+    /// Members authorized at each message's authenticated MLS epoch. Missing means
+    /// unknown (including legacy profiles), never permission to share history.
+    #[serde(default)]
+    pub history_audiences: BTreeMap<String, Vec<String>>,
     pub history_grants: Vec<String>,
     pub deferred: Vec<Envelope>,
     #[serde(default)]
@@ -190,7 +223,63 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Upgrade legacy profiles deterministically, retaining every already assigned name.
+    /// Reserve literal names (for example `Alex_1`) before allocating duplicate suffixes.
+    pub fn normalize_contact_names(&mut self) {
+        let previous = std::mem::take(&mut self.contact_names);
+        let preferred: BTreeMap<_, _> = self
+            .contacts
+            .iter()
+            .map(|(id, contact)| {
+                let name = previous
+                    .get(id)
+                    .filter(|name| valid_contact_name(name))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let name = contact.name.trim();
+                        if name.is_empty() {
+                            "Contact".into()
+                        } else {
+                            name.into()
+                        }
+                    });
+                (id.clone(), name)
+            })
+            .collect();
+        let reserved: std::collections::BTreeSet<_> = preferred.values().cloned().collect();
+        let mut assigned = std::collections::BTreeSet::new();
+        // Previously assigned names win over newly imported contacts even when
+        // the new identity sorts earlier. The remaining order is deterministic.
+        let mut preferred: Vec<_> = preferred.into_iter().collect();
+        preferred.sort_by_key(|(id, _)| {
+            !previous
+                .get(id)
+                .is_some_and(|name| valid_contact_name(name))
+        });
+        for (id, base) in preferred {
+            let name = if assigned.contains(&base) {
+                unique_contact_name(&base, |name| {
+                    assigned.contains(name) || reserved.contains(name)
+                })
+            } else {
+                base
+            };
+            assigned.insert(name.clone());
+            self.contact_names.insert(id, name);
+        }
+    }
+
+    pub(crate) fn set_contact_name(&mut self, id: &str, base: &str) {
+        let name = unique_contact_name(base, |name| {
+            self.contact_names
+                .iter()
+                .any(|(other, existing)| other != id && existing == name)
+        });
+        self.contact_names.insert(id.to_owned(), name);
+    }
+
     pub fn purge_expired(&mut self, time: i64) {
+        self.hosted.purge_expired(time);
         self.messages.retain(|m| m.expires_at > time);
         self.outbox.retain(|m| m.envelope.expires_at > time);
         self.deferred.retain(|m| m.expires_at > time);
@@ -202,11 +291,38 @@ impl AppState {
             .map(|m| format!("{}/{}", m.conversation, m.id))
             .collect();
         self.message_signatures.retain(|id, _| ids.contains(id));
+        self.history_audiences.retain(|id, _| ids.contains(id));
     }
+}
+
+pub(crate) fn valid_contact_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+}
+
+fn unique_contact_name(base: &str, occupied: impl Fn(&str) -> bool) -> String {
+    if !occupied(base) {
+        return base.to_owned();
+    }
+    for number in 1usize.. {
+        let suffix = format!("_{number}");
+        let mut end = base.len().min(128usize.saturating_sub(suffix.len()));
+        while !base.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}{suffix}", &base[..end]);
+        if !occupied(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("a finite contact list cannot exhaust suffixes")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    HostedControl {
+        record: crate::server_protocol::SignedHostedControl,
+    },
+    Server(crate::server_protocol::ServerRequest),
     BlobPut {
         mailbox_id: String,
         write_token: String,
@@ -272,6 +388,7 @@ pub enum Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    Server(crate::server_protocol::ServerResponse),
     Blob(Option<crate::media::MediaChunk>),
     Ok,
     Error(String),
@@ -299,6 +416,14 @@ pub enum Response {
 pub struct Pending {
     pub recipient: String,
     pub request: Request,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedPackageTime {
+    pub issued_at: i64,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub consumed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

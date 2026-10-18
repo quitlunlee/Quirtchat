@@ -19,7 +19,9 @@ use std::{
 use zeroize::Zeroizing;
 
 mod media_view;
+mod service_cli;
 mod ui;
+use service_cli::{MailboxCommand, ServerCommand};
 
 #[derive(Parser)]
 #[command(version, about = "Terminal chat")]
@@ -48,6 +50,17 @@ enum Command {
     },
     Chat,
     Serve,
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
+    Mailbox {
+        #[command(subcommand)]
+        command: MailboxCommand,
+    },
+    Dm {
+        contact: String,
+    },
     Invite {
         #[arg(long)]
         output: Option<PathBuf>,
@@ -90,6 +103,8 @@ enum ContactCommand {
 enum GroupCommand {
     Create {
         name: String,
+        #[arg(long)]
+        server: String,
         #[arg(long = "member", required = true)]
         members: Vec<String>,
     },
@@ -105,6 +120,17 @@ enum GroupCommand {
     Recover {
         conversation: String,
     },
+    Host {
+        conversation: String,
+        server: String,
+    },
+    ServerAdd {
+        address: String,
+    },
+    ServerRemove {
+        endpoint: String,
+    },
+    Servers,
 }
 
 fn password(cli: &Cli, create: bool) -> Result<Zeroizing<String>> {
@@ -200,14 +226,12 @@ async fn main() -> Result<()> {
             .data_dir()
             .to_owned()
     });
+    if let Some(Command::Server { command }) = &cli.command {
+        return service_cli::run_server(&cli, &path, command).await;
+    }
     let creating = matches!(cli.command, Some(Command::Init { .. }));
     if creating {
-        fs::create_dir_all(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-        }
+        service_cli::private_directory(&path)?;
     }
     let db = path.join("profile.db");
     ensure!(
@@ -232,6 +256,43 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     match &cli.command {
+        Some(Command::Mailbox {
+            command: MailboxCommand::Detach,
+        }) => {
+            app.atomic(App::detach_personal_mailbox)?;
+            println!(
+                "Personal mailbox detached; existing cached messages will still be collected."
+            );
+            return Ok(());
+        }
+        Some(Command::Mailbox {
+            command: MailboxCommand::List,
+        }) => {
+            service_cli::show_mailboxes(&app);
+            return Ok(());
+        }
+        Some(Command::Group {
+            command: GroupCommand::ServerAdd { address },
+        }) => {
+            let ticket = service_cli::read_server_ticket(address)?;
+            app.atomic(|app| service_cli::trust_server(app, ticket))?;
+            println!("Group server saved; chat or serve will collect invitations.");
+            return Ok(());
+        }
+        Some(Command::Group {
+            command: GroupCommand::ServerRemove { endpoint },
+        }) => {
+            app.atomic(|app| service_cli::forget_server(app, endpoint))?;
+            return Ok(());
+        }
+        Some(Command::Group {
+            command: GroupCommand::Servers,
+        }) => {
+            for ticket in &app.state.group_servers {
+                println!("{ticket}");
+            }
+            return Ok(());
+        }
         Some(Command::Config { key, value }) => {
             app.atomic(|app| {
                 match key.as_str() {
@@ -383,7 +444,12 @@ async fn main() -> Result<()> {
             }
         }
         Command::Group { command } => match command {
-            GroupCommand::Create { name, members } => {
+            GroupCommand::Create {
+                name,
+                members,
+                server,
+            } => {
+                let server = service_cli::read_server_invitation(&server)?;
                 let members = {
                     let app = shared.lock().unwrap();
                     members
@@ -397,8 +463,20 @@ async fn main() -> Result<()> {
                 let id = shared
                     .lock()
                     .unwrap()
-                    .atomic(|app| app.create_group(name, members))?;
+                    .atomic(|app| app.create_hosted_group(name, members, server))?;
                 println!("Created conversation {id}");
+            }
+            GroupCommand::Host {
+                conversation,
+                server,
+            } => {
+                let server = service_cli::read_server_invitation(&server)?;
+                let mut app = shared.lock().unwrap();
+                let id = app.resolve_group(&conversation)?;
+                app.atomic(|app| app.host_existing_group(&id, server))?;
+                println!(
+                    "Group server configured; run chat or serve until publication is acknowledged."
+                );
             }
             GroupCommand::Add {
                 conversation,
@@ -431,10 +509,26 @@ async fn main() -> Result<()> {
             GroupCommand::Recover { conversation } => {
                 queue_recovery(&shared, &conversation)?;
             }
-            GroupCommand::List => unreachable!(),
+            GroupCommand::List
+            | GroupCommand::Servers
+            | GroupCommand::ServerAdd { .. }
+            | GroupCommand::ServerRemove { .. } => unreachable!(),
         },
+        Command::Mailbox {
+            command: MailboxCommand::Attach { server },
+        } => {
+            let invitation = service_cli::read_server_invitation(&server)?;
+            clichat::app::attach_personal_mailbox(&shared, &transport, invitation).await?;
+            println!(
+                "Personal mailbox bound; private identity and chat keys remain on this client."
+            );
+        }
+        Command::Dm { contact } => {
+            let id = open_direct(&shared, &transport, &contact).await?;
+            println!("Conversation {id}");
+        }
         Command::Send { conversation, text } => {
-            clichat::app::synchronize(&shared, &transport).await;
+            sync_hosted_before_send(&shared, &transport, &conversation).await?;
             let mut app = shared.lock().unwrap();
             let id = app.resolve_group(&conversation)?;
             let message = app.atomic(|app| app.send(&id, text))?;
@@ -445,7 +539,7 @@ async fn main() -> Result<()> {
             file,
             caption,
         } => {
-            clichat::app::synchronize(&shared, &transport).await;
+            sync_hosted_before_send(&shared, &transport, &conversation).await?;
             let id = shared.lock().unwrap().resolve_group(&conversation)?;
             let message = send_media(&shared, &id, file, caption).await?;
             println!(
@@ -526,6 +620,78 @@ pub(crate) fn queue_recovery(shared: &Shared, conversation: &str) -> Result<()> 
     })
 }
 
+async fn sync_hosted_before_send(
+    shared: &Shared,
+    transport: &Transport,
+    query: &str,
+) -> Result<()> {
+    let hosted = {
+        let app = shared.lock().unwrap();
+        let id = app.resolve_group(query)?;
+        app.state.conversations[&id].server.is_some()
+    };
+    if hosted {
+        clichat::app::group_delivery_tick(shared, transport).await?;
+    }
+    Ok(())
+}
+
+async fn open_direct(shared: &Shared, transport: &Transport, contact: &str) -> Result<String> {
+    let member = shared.lock().unwrap().resolve_contact(contact)?;
+    open_direct_id(shared, transport, member).await
+}
+
+/// UI selections already carry a verified identity and must never be re-resolved
+/// as a nickname (a nickname can legally resemble another contact's full ID).
+async fn open_direct_id(shared: &Shared, transport: &Transport, member: String) -> Result<String> {
+    let existing = {
+        let app = shared.lock().unwrap();
+        ensure!(app.state.contacts.contains_key(&member), "unknown contact");
+        app.state
+            .conversations
+            .values()
+            .find(|group| {
+                group.active
+                    && group.server.is_none()
+                    && group.members.len() == 2
+                    && group.members.contains(&member)
+            })
+            .map(|group| group.id.clone())
+    };
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    acquire_key_package(shared, transport, &member).await?;
+    shared
+        .lock()
+        .unwrap()
+        .atomic(|app| app.create_direct(app.contact_name(&member).to_owned(), member))
+}
+
+fn command_words(input: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for ch in input.chars() {
+        if Some(ch) == quote {
+            quote = None;
+        } else if quote.is_none() && (ch == '"' || ch == '\'') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    ensure!(quote.is_none(), "unclosed quote");
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Ok(words)
+}
+
 pub(crate) async fn ui_command(
     shared: &Shared,
     transport: &Transport,
@@ -578,33 +744,20 @@ pub(crate) async fn ui_command(
         }
         "/use" => *selected = Some(shared.lock().unwrap().resolve_group(rest)?),
         "/dm" => {
-            let member = shared.lock().unwrap().resolve_contact(rest)?;
-            let existing = {
-                let app = shared.lock().unwrap();
-                app.state
-                    .conversations
-                    .values()
-                    .find(|g| g.active && g.members.len() == 2 && g.members.contains(&member))
-                    .map(|g| g.id.clone())
-            };
-            if let Some(id) = existing {
-                *selected = Some(id);
-            } else {
-                acquire_key_package(shared, transport, &member).await?;
-                *selected = Some(
-                    shared
-                        .lock()
-                        .unwrap()
-                        .atomic(|app| app.create_group(rest.into(), vec![member]))?,
-                );
-            }
+            *selected = Some(open_direct(shared, transport, rest).await?);
         }
         "/group" => {
-            let mut words = rest.split_whitespace();
+            let words = command_words(rest)?;
+            let mut words = words.iter();
             let name = words
                 .next()
-                .context("use /group NAME CONTACT...")?
+                .context("use /group NAME SERVER_INVITATION CONTACT...")?
                 .to_owned();
+            let server = service_cli::read_server_invitation(
+                words
+                    .next()
+                    .context("server invitation file or code required")?,
+            )?;
             let members = {
                 let app = shared.lock().unwrap();
                 words
@@ -619,8 +772,43 @@ pub(crate) async fn ui_command(
                 shared
                     .lock()
                     .unwrap()
-                    .atomic(|app| app.create_group(name, members))?,
+                    .atomic(|app| app.create_hosted_group(name, members, server))?,
             );
+        }
+        "/server-add" => {
+            let ticket = service_cli::read_server_ticket(rest)?;
+            shared
+                .lock()
+                .unwrap()
+                .atomic(|app| service_cli::trust_server(app, ticket))?;
+            shared.lock().unwrap().status = "group server saved".into();
+        }
+        "/group-host" => {
+            let group = selected.as_ref().context("select the group to migrate")?;
+            let server = service_cli::read_server_invitation(rest)?;
+            shared
+                .lock()
+                .unwrap()
+                .atomic(|app| app.host_existing_group(group, server))?;
+        }
+        "/mailbox" => {
+            let (action, value) = rest.trim().split_once(' ').unwrap_or((rest.trim(), ""));
+            match action {
+                "attach" => {
+                    let invitation = service_cli::read_server_invitation(value)?;
+                    clichat::app::attach_personal_mailbox(shared, transport, invitation).await?;
+                    shared.lock().unwrap().status = "personal mailbox bound".into();
+                }
+                "detach" => {
+                    shared
+                        .lock()
+                        .unwrap()
+                        .atomic(App::detach_personal_mailbox)?;
+                    shared.lock().unwrap().status =
+                        "personal mailbox detached; draining pending mail".into();
+                }
+                _ => bail!("use /mailbox attach SERVER_INVITATION or /mailbox detach"),
+            }
         }
         "/add-member" | "/kick" => {
             let group = selected.as_ref().context("no conversation")?.clone();

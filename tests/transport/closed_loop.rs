@@ -125,7 +125,7 @@ async fn three_nodes_deliver_cached_ciphertext_after_profile_restart() -> Result
         connect_contact(&bob.app, &bob.transport, &alice_id).await?;
         acquire_key_package(&alice.app, &alice.transport, &bob_id).await?;
         let group = alice.app.lock().unwrap().atomic(|app| {
-            let group = app.create_group("network pair".into(), vec![bob_id.clone()])?;
+            let group = app.create_direct("network pair".into(), bob_id.clone())?;
             app.state.last_rekey.insert(group.clone(), now());
             Ok(group)
         })?;
